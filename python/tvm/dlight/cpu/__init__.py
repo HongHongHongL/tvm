@@ -14,15 +14,11 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""DLight package provides efficient schedules out-of-box for deep learning workloads."""
-from . import gpu
-from . import cpu
-from .base import (
-    ApplyDefaultSchedule,
-    BlockInfo,
-    IterInfo,
-    ScheduleRule,
-    normalize_prim_func,
-    try_inline,
-    try_inline_contiguous_spatial,
-)
+"""
+CPU-generic schedule rules.
+"""
+
+# from .fallback import Fallback
+from .matmul import Matmul
+from .reduction import Reduction
+from .element_wise import ElementWise

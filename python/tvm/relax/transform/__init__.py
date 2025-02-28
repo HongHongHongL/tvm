@@ -95,6 +95,9 @@ from .lazy_transform_params import LazyTransformParams
 from .lower_gpu_ipc_alloc_storage import LowerGPUIPCAllocStorage
 from .optimize_layout_transform import OptimizeLayoutTransform
 from .remove_redundant_reshape import RemoveRedundantReshape
+from .fuse_layer_norm import FuseLayerNormTransform
+from .fuse_w4_conv import FuseW4ConvTransform
+from .attach_variable_bounds import AttachVariableBounds
 
 # Import to register the legalization functions.
 from . import legalize_ops, tuning_api

@@ -99,6 +99,7 @@ def autopad(
     # split total padding into before and after
     pad_before = _np.floor_divide(total_pad, two)
     pad_after = total_pad - pad_before
+    return tuple(_np.concatenate([pad_before, pad_after], 0))
 
     # combine
     if "LOWER" in mode:

@@ -343,8 +343,10 @@ class BinaryBase(OnnxOpConverter):
         if any([isinstance(inp, relax.PrimValue) for inp in inputs]):
             x = _to_numpy(inputs[0])
             y = _to_numpy(inputs[1])
-            return relax.PrimValue(cls.numpy_op(x, y))  # pylint: disable=not-callable
+            return relax.PrimValue(int(cls.numpy_op(x, y)))  # pylint: disable=not-callable
 
+        if inputs[1].struct_info.ndim == 0:
+            inputs[1] = get_constant(inputs[1], params)
         return cls.relax_op(inputs[0], inputs[1])  # pylint: disable=not-callable
 
 
@@ -400,6 +402,11 @@ class Pow(BinaryBase):
 
     @classmethod
     def _impl_v7(cls, bb, inputs, attr, params):
+        y = get_constant(inputs[1], params)
+        if y.data.numpy().tolist() == 2.0:
+            return relax.op.multiply(inputs[0], inputs[0])
+        if y.data.numpy().tolist() == 0.5:
+            return relax.op.sqrt(inputs[0])
         return cls.base_impl(bb, inputs, attr, params)
 
 
@@ -661,6 +668,8 @@ class Unsqueeze(OnnxOpConverter):
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
         axes = get_constant(inputs[1], params)
+        if axes == None:
+            axes = attr.get("axes")
 
         # Handle ONNX shape inference
         if isinstance(data, relax.PrimValue) and isinstance(axes, relax.Constant):
@@ -1234,10 +1243,20 @@ class Conv(OnnxOpConverter):
         else:
             raise NotImplementedError("Ndim > 5 not supported for convolution.")
 
+        pads = attr.get("pads", 0)
         if "auto_pad" in attr:
             attr["auto_pad"] = attr["auto_pad"].decode("utf-8")
             if attr["auto_pad"] in ("SAME_UPPER", "SAME_LOWER"):
-                data = autopad(
+                # data = autopad(
+                #     bb,
+                #     inputs[0],
+                #     attr.get("strides", [1] * (ndim - 2)),
+                #     attr["kernel_shape"],
+                #     attr.get("dilations", [1] * (ndim - 2)),
+                #     mode=attr["auto_pad"],
+                #     deconv=False,
+                # )
+                pads = autopad(
                     bb,
                     inputs[0],
                     attr.get("strides", [1] * (ndim - 2)),
@@ -1263,7 +1282,7 @@ class Conv(OnnxOpConverter):
                 data=data,
                 weight=inputs[1],
                 strides=attr.get("strides", 1),
-                padding=attr.get("pads", 0),
+                padding=pads,
                 dilation=attr.get("dilations", 1),
                 groups=attr.get("group", 1),
                 data_layout=data_layout,
@@ -1305,6 +1324,7 @@ class ConvTranspose(OnnxOpConverter):
             weight=inputs[1],
             strides=attr.get("strides", 1),
             padding=attr.get("pads", 0),
+            output_padding=attr.get("output_padding", 0),
             dilation=attr.get("dilations", 1),
             groups=attr.get("group", 1),
             data_layout=data_layout,
@@ -1316,6 +1336,154 @@ class ConvTranspose(OnnxOpConverter):
             conv_out = relax.op.add(conv_out, bias)
 
         return conv_out
+
+
+class w4_conv(OnnxOpConverter):
+    """Convert an ONNX w4_conv node into an equivalent Relax expression."""
+
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        """
+        Implementation of w4_conv for opset version 11.
+
+        Parameters:
+            bb: BlockBuilder instance.
+            inputs: List of input tensors.
+                - inputs[0]: Input data tensor (e.g., int8[256,1,5]).
+                - inputs[1]: Compressed weights tensor (int8[256,1,5]).
+                - inputs[2]: Scaling factors tensor (float32[512,1,1]).
+                - inputs[3]: (Optional) Bias tensor.
+            attr: Dictionary of attributes.
+            params: Additional parameters.
+
+        Returns:
+            The Relax expression representing the convolution.
+        """
+
+        data = inputs[0]  # Input data tensor
+        weight_compressed = inputs[1]  # Compressed weights (int8)
+        scale = inputs[2]  # Scaling factors (float32)
+
+        # Step 1: Unpack int8 to int4
+        weight_int4 = cls._unpack_int4(bb, weight_compressed, scale)
+        # Step 2: Convert int4 to float32 by dividing by scale
+        weight_float32 = relax.op.multiply(
+            relax.op.astype(weight_int4, dtype=data.struct_info.dtype),
+            scale
+        )
+        weight_float32 = bb.normalize(weight_float32)
+        # weight_float32 = relax.op.astype(weight_float32, dtype="float32")
+        if hasattr(inputs[0].struct_info, "ndim"):
+            ndim = inputs[0].struct_info.ndim
+        else:
+            ndim = len(inputs[0].struct_info.shape)
+
+        if "kernel_shape" not in attr:
+            attr["kernel_shape"] = inputs[1].struct_info.shape.values[2:]
+
+        if ndim == 3:
+            op = relax.op.nn.conv1d
+            data_layout = "NCW"
+            kernel_layout = "OIW"
+        elif ndim == 4:
+            op = relax.op.nn.conv2d
+            data_layout = "NCHW"
+            kernel_layout = "OIHW"
+        elif ndim == 5:
+            op = relax.op.nn.conv3d
+            data_layout = "NCDHW"
+            kernel_layout = "OIDHW"
+        else:
+            raise NotImplementedError("Ndim > 5 not supported for convolution.")
+
+
+        pads = attr.get("pads", 0)
+        if "auto_pad" in attr:
+            attr["auto_pad"] = attr["auto_pad"].decode("utf-8")
+            if attr["auto_pad"] in ("SAME_UPPER", "SAME_LOWER"):
+                pads = autopad(
+                    bb,
+                    inputs[0],
+                    attr.get("strides", [1] * (ndim - 2)),
+                    attr["kernel_shape"],
+                    attr.get("dilations", [1] * (ndim - 2)),
+                    mode=attr["auto_pad"],
+                    deconv=False,
+                )
+            elif attr["auto_pad"] == "VALID":
+                attr["pads"] = [0 for _ in range(ndim - 2)]
+            elif attr["auto_pad"] == "NOTSET":
+                pass
+            else:
+                msg = (
+                    f'Value {attr["auto_pad"]} in attribute "auto_pad" of operator Conv '
+                    f"is invalid."
+                )
+                raise tvm.error.OpAttributeInvalid(msg)
+            attr.pop("auto_pad")
+
+        # Perform the convolution
+        conv_out = bb.normalize(
+            op(
+                data=data,
+                weight= weight_float32,
+                strides=attr.get("strides", 1),
+                padding=pads,
+                dilation=attr.get("dilations", 1),
+                groups=attr.get("group", 1),
+                data_layout=data_layout,
+                kernel_layout=kernel_layout,
+            )
+        )
+
+        if inputs[3] is not None:
+            bias = relax.op.reshape(inputs[3], [1, -1] + [1] * (ndim - 2))
+            conv_out = relax.op.add(conv_out, bias)
+
+        return conv_out
+
+    @staticmethod
+    def _unpack_int4(bb, compressed_weight, scale):
+        """
+        Unpacks int8 compressed weights into int4.
+
+        Parameters:
+            bb: BlockBuilder instance.
+            compressed_weight: Relax expression of int8 tensor containing packed int4 weights.
+
+        Returns:
+            A Relax expression of int4 weights.
+        """
+        # 将常量4和0x0F转换为Relax常量
+        # const_4 = relax.const(4, "int8")
+        # const_0x0F = relax.const(0x0F, "int8")
+        # const_8 = relax.const(8, "int8")
+        
+        # # Extract high and low nibbles
+        # high_nibble = relax.op.right_shift(compressed_weight, const_4)
+        # high_nibble = relax.op.bitwise_and(high_nibble, const_0x0F )
+        # low_nibble = relax.op.bitwise_and(compressed_weight, const_0x0F )
+        # high_nibble = relax.op.subtract(high_nibble, const_8)
+        # high_nibble = bb.normalize(high_nibble)
+        # low_nibble = relax.op.subtract(low_nibble, const_8)
+        # low_nibble = bb.normalize(low_nibble)
+        # # Cast to int8 to prevent overflow during concatenation
+        # # high_nibble = relax.op.astype(high_nibble, dtype="int8")
+        # # low_nibble = relax.op.astype(low_nibble, dtype="int8")
+
+        # # Concatenate high and low nibbles along the channel dimension
+        # # Assuming the channel dimension is axis=0
+        # if high_nibble.struct_info.shape[0] != 1:
+        #     weight_int4 = relax.op.concat([high_nibble, low_nibble], axis=0)
+        # else:
+        #     weight_int4 = relax.op.concat([high_nibble, low_nibble], axis=1)
+        # return bb.normalize(weight_int4)
+        OC_real = scale.struct_info.shape[0] if len(scale.struct_info.shape) != 0 else 1
+        if compressed_weight.struct_info.shape[0] != OC_real:
+            weight_int4 = relax.op.repeat(compressed_weight,2,0)
+        else:
+            weight_int4 = relax.op.repeat(compressed_weight,2,1)
+        return bb.normalize(weight_int4)
 
 
 class Erf(OnnxOpConverter):
@@ -1352,6 +1520,8 @@ class Squeeze(OnnxOpConverter):
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
         axis = get_constant(inputs[1], params)
+        if axis == None:
+            axis = attr.get("axes", None)
         if isinstance(axis, relax.Constant):
             axis = tuple([int(x) for x in axis.data.numpy()])
 
@@ -1613,16 +1783,25 @@ class MultiInputBase(OnnxOpConverter):
             return relax.const(output, output.dtype)
 
         # Expand inputs, stack them, then perform minimum over the new axis.
+        inputs[1] = relax.op.broadcast_to(inputs[1], inputs[0].struct_info.shape)
         inputs = [bb.normalize(relax.op.expand_dims(i, axis=0)) for i in inputs]
         stacked_tensor = relax.op.concat(inputs, axis=0)
         return cls.relax_op(stacked_tensor, axis=0)  # pylint: disable=not-callable
 
 
-class Min(MultiInputBase):
+# class Min(MultiInputBase):
+#     """Converts an onnx Min node into an equivalent Relax expression."""
+
+#     numpy_op = _np.min
+#     relax_op = relax.op.min
+
+
+class Min(OnnxOpConverter):
     """Converts an onnx Min node into an equivalent Relax expression."""
 
-    numpy_op = _np.min
-    relax_op = relax.op.min
+    @classmethod
+    def _impl_v13(cls, bb, inputs, attr, params):
+        return relax.op.minimum(inputs[0], inputs[1])
 
 
 class Max(MultiInputBase):
@@ -1719,7 +1898,7 @@ class Split(OnnxOpConverter):
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
-        splits = inputs[1]
+        splits = get_constant(inputs[1], params)
         splits_rank = None
         if splits is not None:
             splits_rank = splits.checked_type.ndim
@@ -2527,7 +2706,8 @@ class ReduceSum(OnnxOpConverter):
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
         data = inputs[0]
-        axes = inputs[1]
+        # axes = inputs[1]
+        axes = get_constant(inputs[1], params)
         keepdims = attr.get("keepdims", 1)
         assert isinstance(axes, relax.Constant), "Only constant axes currently supported."
         axes = axes.data.numpy().tolist()
@@ -2699,7 +2879,8 @@ class TopK(OnnxOpConverter):
     @classmethod
     def _impl_v11(cls, bb, inputs, attr, params):
         data = inputs[0]
-        k = inputs[1]
+        # k = inputs[1]
+        k = get_constant(inputs[1], params)
         if not isinstance(k, relax.Constant):
             raise ValueError("TopK k must be a constant")
         k = int(k.data.numpy())
@@ -2806,7 +2987,7 @@ class OneHot(OnnxOpConverter):
         values = values.data.numpy().tolist()
         off_value, on_value = values
         off_value, on_value = relax.PrimValue(off_value), relax.PrimValue(on_value)
-        return relax.op.one_hot(indices, on_value, off_value, depth, axis)
+        return relax.op.one_hot(indices, on_value, off_value, depth[0], axis)
 
 
 class Unique(OnnxOpConverter):
@@ -3089,6 +3270,34 @@ class SequenceAt(OnnxOpConverter):
         return input_sequence[position]
 
 
+class RandomUniform(OnnxOpConverter):
+    """Operator converter for random uniform op."""
+    
+    @classmethod
+    def _impl_v1(cls, bb, inputs, attr, params):
+        dtype = get_type(attr.get("dtype", 1))
+        high = attr.get("high", 1.0)
+        low = attr.get("low", 0.0)
+        seed = attr.get("seed", None)
+        shape = attr["shape"]
+
+        assert dtype in [
+            "float32",
+            "float64",
+        ], "Only float random value generation is currently supported."
+
+        if seed is None:
+            seed = _np.random.randint(1e6)
+        else:
+            seed = int(seed)
+        import sys
+        s = _np.frombuffer(seed.to_bytes(32, sys.byteorder), dtype="uint64")
+        a = _np.concatenate((s, _np.array([0, 0, 0, 0, 1 << 63, 0], dtype="uint64")))
+        key = relax.const(a)
+        _, vals = bb.emit_te(topi.random.uniform, key, low, high, shape, dtype)
+        return vals
+
+
 def _get_convert_map():
     return {
         # defs/experimental
@@ -3254,6 +3463,8 @@ def _get_convert_map():
         "ConcatFromSequence": ConcatFromSequence,
         "SplitToSequence": SplitToSequence,
         "SequenceAt": SequenceAt,
+        "RandomUniform": RandomUniform,
+        "w4_conv": w4_conv,
     }
 
 
